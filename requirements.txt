@@ -1,7 +1,7 @@
+numpy>=1.21
 soundfile
 librosa
 streamlit
 matplotlib
-# Opcionales:
 pyrubberband
 pyloudnorm

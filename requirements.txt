@@ -1,5 +1,7 @@
-streamlit
-librosa
 soundfile
-numpy
-scipy
+librosa
+streamlit
+matplotlib
+# Opcionales:
+pyrubberband
+pyloudnorm

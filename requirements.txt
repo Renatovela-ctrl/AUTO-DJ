@@ -3,5 +3,3 @@ librosa
 soundfile
 numpy
 scipy
-numba
-yt-dlp

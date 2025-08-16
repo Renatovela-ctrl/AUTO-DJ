@@ -1,3 +1,23 @@
+"""
+DJ Mixer AI - Versión mejorada
+Mejoras añadidas basadas en prácticas profesionales de DJs:
+ - Soporte estéreo (preservando canales)
+ - Beatgrid y sincronización a compases/tiempos (snap a beat)
+ - Ajuste de tempo beat-sincrónico (phase vocoder) con fallback
+ - Ajuste de pitch (con opción de usar pyrubberband si está instalada)
+ - Emparejamiento de nivel (RMS) y normalización suave
+ - Crossfades sincronizados a beats y con curvas: equal-power, linear, exponencial
+ - Visualización de forma de onda y marcadores de beat (matplotlib)
+ - Previsualización de pistas alineadas antes de mezclar
+ - Protección contra cambios extremos de pitch/tempo y mensajes al usuario
+ - Mejor manejo de errores y logs
+
+Requerimientos (pip):
+ librosa, soundfile, numpy, streamlit, matplotlib
+ Opcionales: pyrubberband (mejor preservación de formantes), pyloudnorm (LUFS)
+
+Uso: abre con `streamlit run DJ_Mixer_AI_mejorado.py`
+"""
 
 import io
 import math
@@ -424,3 +444,18 @@ if file_a and file_b:
                 st.error(f"Error durante la mezcla: {e}")
 else:
     st.info("👆 Sube dos archivos de audio para comenzar.")
+
+# -----------------------------
+# Notas de desarrollo / próximos pasos
+# -----------------------------
+st.markdown("---")
+st.subheader("Sugerencias para mejorar aún más (no incluidas por defecto)")
+st.markdown("""
+- Usar `pyrubberband` para pitch shifting de mejor calidad (preserva formantes). Si quieres lo activo por defecto.
+- Usar `pyloudnorm` para normalización LUFS profesional (ideal para mezcla entre pistas masterizadas de distinto origen).
+- Implementar detección de "phrases" (8/16 compases) para que los crossfades ocurran en puntos musicales relevantes.
+- Añadir controles en tiempo real (faders, sync toggle) y una vista de grid para mover puntos de mezcla manualmente.
+- Exportar un pequeño cue con metadata (BPM, key, semitone shift, gain aplicado).
+""")
+
+logger.info("DJ Mixer AI cargado.")

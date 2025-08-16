@@ -1,13 +1,8 @@
 import io
-import os
-import tempfile
-from typing import Tuple, Optional
-
 import numpy as np
 import streamlit as st
 import soundfile as sf
 import librosa
-import yt_dlp
 
 # -----------------------------
 # Helpers
@@ -20,24 +15,8 @@ def db(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
     return 20 * np.log10(np.maximum(eps, np.abs(x)))
 
 
-def download_audio_from_youtube(url: str, sr: int = 44100) -> Tuple[np.ndarray, int]:
-    """Descargar audio desde YouTube y devolver como waveform."""
-    tmpdir = tempfile.mkdtemp()
-    outtmpl = os.path.join(tmpdir, "%(id)s.%(ext)s")
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": outtmpl,
-        "quiet": True,
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "wav",
-            "preferredquality": "192",
-        }],
-    }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info).rsplit(".", 1)[0] + ".wav"
-    y, sr = librosa.load(filename, sr=sr, mono=True)
+def load_audio(file, sr: int = 44100) -> tuple[np.ndarray, int]:
+    y, sr = librosa.load(file, sr=sr, mono=True)
     return y.astype(np.float32), sr
 
 
@@ -46,7 +25,7 @@ def estimate_bpm(y: np.ndarray, sr: int) -> float:
     return float(tempo) if tempo > 0 else 120.0
 
 
-def estimate_key(y: np.ndarray, sr: int) -> Tuple[str, int]:
+def estimate_key(y: np.ndarray, sr: int) -> tuple[str, int]:
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
     profile = chroma.mean(axis=1)
     pitch_class = int(np.argmax(profile))
@@ -71,7 +50,7 @@ def pitch_shift(y: np.ndarray, sr: int, n_semitones: float) -> np.ndarray:
 
 
 def align_to_target(y: np.ndarray, sr: int, bpm: float, key_pc: int,
-                    target_bpm: float, target_key_pc: Optional[int],
+                    target_bpm: float, target_key_pc: int | None,
                     do_time: bool, do_pitch: bool) -> np.ndarray:
     x = y
     if do_time and bpm > 0:
@@ -81,25 +60,37 @@ def align_to_target(y: np.ndarray, sr: int, bpm: float, key_pc: int,
     return x
 
 
-def make_equal_power_fade(n: int) -> Tuple[np.ndarray, np.ndarray]:
+def make_equal_power_fade(n: int) -> tuple[np.ndarray, np.ndarray]:
     t = np.linspace(0, 1, num=n, dtype=np.float32)
     return np.cos(t * np.pi / 2), np.sin(t * np.pi / 2)
 
 
-def crossfade_tracks(a: np.ndarray, b: np.ndarray, sr: int, overlap_sec: float = 10.0) -> np.ndarray:
+def crossfade_tracks(a: np.ndarray, b: np.ndarray, sr: int, overlap_sec: float = 10.0,
+                     a_mix_start: float = 0.0, b_mix_start: float = 0.0) -> np.ndarray:
+    # convert sec -> samples
+    a_start = int(a_mix_start * sr)
+    b_start = int(b_mix_start * sr)
     fade_len = int(overlap_sec * sr)
-    n = min(len(a), len(b), fade_len)
+
+    a_seg = a[a_start:a_start + fade_len]
+    b_seg = b[b_start:b_start + fade_len]
+    n = min(len(a_seg), len(b_seg))
+    if n <= 0:
+        return np.concatenate([a, b])
+
     fade_out, fade_in = make_equal_power_fade(n)
-    a_seg = a[-n:] * fade_out
-    b_seg = b[:n] * fade_in
-    mixed_overlap = a_seg + b_seg
-    return np.concatenate([a[:-n], mixed_overlap, b[n:]])
+    mixed_overlap = a_seg[:n] * fade_out + b_seg[:n] * fade_in
+    return np.concatenate([a[:a_start], mixed_overlap, b[b_start + n:]])
 
 
-def add_clean_segments(a: np.ndarray, b: np.ndarray, sr: int, extra_sec: int = 10) -> np.ndarray:
+def add_clean_segments(a: np.ndarray, b: np.ndarray, sr: int, extra_sec: int = 10,
+                       a_mix_start: float = 0.0, b_mix_start: float = 0.0) -> np.ndarray:
     extra_a = a[-extra_sec * sr:]
     extra_b = b[:extra_sec * sr]
-    return np.concatenate([extra_a, crossfade_tracks(a, b, sr), extra_b])
+    return np.concatenate([extra_a, crossfade_tracks(a, b, sr, overlap_sec=10.0,
+                                                    a_mix_start=a_mix_start,
+                                                    b_mix_start=b_mix_start),
+                           extra_b])
 
 
 def write_wav_to_bytes(y: np.ndarray, sr: int) -> bytes:
@@ -113,8 +104,8 @@ def write_wav_to_bytes(y: np.ndarray, sr: int) -> bytes:
 # -----------------------------
 st.set_page_config(page_title="DJ Mixer AI", page_icon="🎧", layout="wide")
 
-st.title("🎧 Mezclador DJ con IA (YouTube Edition)")
-st.write("Ingresa dos links de YouTube y el sistema descargará, analizará y mezclará los tracks.")
+st.title("🎧 Mezclador DJ con IA (Archivos locales)")
+st.write("Sube dos canciones y el sistema hará una mezcla con crossfade. Puedes elegir en qué segundo de cada track comienza la mezcla.")
 
 with st.sidebar:
     st.header("Opciones")
@@ -122,15 +113,20 @@ with st.sidebar:
     align_tempo = st.checkbox("Alinear tempo", value=True)
     align_key = st.checkbox("Alinear tono (pitch)", value=True)
     extra_sec = st.slider("Segundos extra de A y B", 5, 20, 10)
+    a_mix_start = st.number_input("Inicio de mezcla en track A (seg)", min_value=0, value=30)
+    b_mix_start = st.number_input("Inicio de mezcla en track B (seg)", min_value=0, value=0)
 
-url_a = st.text_input("Link YouTube - Canción A")
-url_b = st.text_input("Link YouTube - Canción B")
+col1, col2 = st.columns(2)
+with col1:
+    file_a = st.file_uploader("Canción A (WAV/MP3/OGG)", type=["wav", "mp3", "ogg", "flac"], key="a")
+with col2:
+    file_b = st.file_uploader("Canción B (WAV/MP3/OGG)", type=["wav", "mp3", "ogg", "flac"], key="b")
 
-if url_a and url_b:
+if file_a and file_b:
     if st.button("Mezclar 🎶"):
-        with st.spinner("Descargando y mezclando..."):
-            y_a, sr = download_audio_from_youtube(url_a)
-            y_b, _ = download_audio_from_youtube(url_b)
+        with st.spinner("Procesando tracks..."):
+            y_a, sr = load_audio(file_a)
+            y_b, _ = load_audio(file_b, sr=sr)
 
             bpm_a = estimate_bpm(y_a, sr)
             bpm_b = estimate_bpm(y_b, sr)
@@ -142,7 +138,8 @@ if url_a and url_b:
             y_a_aligned = align_to_target(y_a, sr, bpm_a, key_pc_a, target_bpm, target_key_pc, align_tempo, align_key)
             y_b_aligned = align_to_target(y_b, sr, bpm_b, key_pc_b, target_bpm, target_key_pc, align_tempo, align_key)
 
-            mixed = add_clean_segments(y_a_aligned, y_b_aligned, sr, extra_sec=extra_sec)
+            mixed = add_clean_segments(y_a_aligned, y_b_aligned, sr, extra_sec=extra_sec,
+                                       a_mix_start=a_mix_start, b_mix_start=b_mix_start)
 
         st.markdown("### Análisis")
         col1, col2, col3 = st.columns(3)
@@ -162,4 +159,4 @@ if url_a and url_b:
                            file_name="mezcla_dj_ai.wav", mime="audio/wav")
 
 else:
-    st.info("👆 Ingresa dos links de YouTube para comenzar.")
+    st.info("👆 Sube dos archivos de audio para comenzar.")

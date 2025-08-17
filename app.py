@@ -3,152 +3,192 @@ import numpy as np
 import streamlit as st
 import soundfile as sf
 import librosa
-from librosa.effects import time_stretch as lb_time_stretch, pitch_shift as lb_pitch_shift
 
-# Configuración inicial
+# Import explícito con alias para evitar colisiones
+from librosa.effects import time_stretch as lb_time_stretch
+from librosa.effects import pitch_shift as lb_pitch_shift
+
+# -----------------------------
+# Helpers
+# -----------------------------
 MAJOR_KEYS = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
-DEFAULT_SR = 44100
 
-def load_audio(file, sr: int = DEFAULT_SR) -> tuple[np.ndarray, int]:
-    """Carga el audio con manejo de errores mejorado"""
-    try:
-        y, sr = librosa.load(file, sr=sr, mono=True)
-        return y.astype(np.float32), sr
-    except Exception as e:
-        st.error(f"Error al cargar el archivo: {str(e)}")
-        raise
+def load_audio(file, sr: int = 44100) -> tuple[np.ndarray, int]:
+    y, sr = librosa.load(file, sr=sr, mono=True)
+    return y.astype(np.float32), sr
 
 def estimate_bpm(y: np.ndarray, sr: int) -> float:
-    """Estimación de BPM más robusta"""
-    try:
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr, start_bpm=120)
-        return float(tempo) if tempo and tempo > 0 else 120.0
-    except:
-        return 120.0
+    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+    return float(tempo) if tempo and tempo > 0 else 120.0
 
 def estimate_key(y: np.ndarray, sr: int) -> tuple[str, int]:
-    """Estimación de clave musical mejorada"""
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+    profile = chroma.mean(axis=1)
+
+    major_profile = np.array([6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88])
+    minor_profile = np.array([6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17])
+
+    corr_major = np.array([np.dot(np.roll(profile, -k), major_profile) for k in range(12)])
+    corr_minor = np.array([np.dot(np.roll(profile, -k), minor_profile) for k in range(12)])
+
+    if corr_major.max() >= corr_minor.max():
+        pc = int(np.argmax(corr_major))
+        return f"{MAJOR_KEYS[pc]} Major", pc
+    else:
+        pc = int(np.argmax(corr_minor))
+        return f"{MAJOR_KEYS[pc]} Minor", pc
+
+def semitones_to_shift(src_pc: int, tgt_pc: int) -> int:
+    d = tgt_pc - src_pc
+    if d > 6: d -= 12
+    if d < -6: d += 12
+    return int(d)
+
+# Fallback propio para evitar errores de librosa
+def _pv_time_stretch(y: np.ndarray, rate: float, hop_length: int = 512, win_length: int = 2048) -> np.ndarray:
+    if rate <= 0: return y
+    stft = librosa.stft(y, n_fft=win_length, hop_length=hop_length, win_length=win_length)
+    stretched = librosa.phase_vocoder(stft, rate=rate, hop_length=hop_length)
+    y_out = librosa.istft(stretched, hop_length=hop_length, win_length=win_length, length=int(round(len(y)/rate)))
+    return y_out.astype(np.float32)
+
+def apply_time_stretch(y: np.ndarray, rate: float) -> np.ndarray:
+    if rate <= 0 or np.isclose(rate, 1.0): return y
     try:
-        chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
-        profile = chroma.mean(axis=1)
-        
-        major_profile = np.array([6.35,2.23,3.48,2.33,4.38,4.09,2.52,5.19,2.39,3.66,2.29,2.88])
-        minor_profile = np.array([6.33,2.68,3.52,5.38,2.60,3.53,2.54,4.75,3.98,2.69,3.34,3.17])
-        
-        corr_major = np.array([np.dot(np.roll(profile, -k), major_profile) for k in range(12)])
-        corr_minor = np.array([np.dot(np.roll(profile, -k), minor_profile) for k in range(12)])
-        
-        if corr_major.max() >= corr_minor.max():
-            pc = int(np.argmax(corr_major))
-            return f"{MAJOR_KEYS[pc]} Major", pc
-        else:
-            pc = int(np.argmax(corr_minor))
-            return f"{MAJOR_KEYS[pc]} Minor", pc
-    except:
-        return "C Major", 0
+        return lb_time_stretch(y, rate).astype(np.float32)
+    except Exception:
+        return _pv_time_stretch(y, rate)
 
-def beat_sync_mix(y1: np.ndarray, y2: np.ndarray, sr: int, bpm: float, overlap_beats: int = 8) -> np.ndarray:
-    """Mezcla sincronizada por beats para transiciones más profesionales"""
-    beat_length = 60 / bpm  # duración de un beat en segundos
-    beat_samples = int(beat_length * sr)
-    
-    # Encontrar el primer beat fuerte para alinear
-    onset_env = librosa.onset.onset_strength(y=y1, sr=sr)
-    beats = librosa.beat.beat_track(onset_envelope=onset_env, sr=sr, start_bpm=bpm)[1]
-    first_strong_beat = librosa.frames_to_samples(beats[0]) if len(beats) > 0 else 0
-    
-    # Asegurar que tenemos suficiente audio para la mezcla
-    mix_start = first_strong_beat
-    mix_duration = overlap_beats * beat_samples
-    mix_end = mix_start + mix_duration
-    
-    if mix_end > len(y1) or mix_duration > len(y2):
-        # Fallback a crossfade simple si no hay suficiente audio
-        return simple_crossfade(y1, y2, sr, overlap_sec=8*beat_length)
-    
-    # Crear ventana de mezcla
-    fade_out = np.sqrt(np.linspace(1, 0, mix_duration))  # curva sqrt para mejor transición
-    fade_in = np.sqrt(np.linspace(0, 1, mix_duration))
-    
-    # Aplicar la mezcla
-    mixed = np.concatenate([
-        y1[:mix_start],
-        y1[mix_start:mix_end] * fade_out + y2[:mix_duration] * fade_in,
-        y2[mix_duration:]
-    ])
-    
-    return mixed
+def apply_pitch_shift(y: np.ndarray, sr: int, n_semitones: float) -> np.ndarray:
+    if abs(n_semitones) <= 1e-6: return y
+    try:
+        return lb_pitch_shift(y, sr=sr, n_steps=n_semitones).astype(np.float32)
+    except Exception:
+        factor = 2.0 ** (n_semitones / 12.0)
+        y_ps = librosa.resample(y, orig_sr=sr, target_sr=int(round(sr*factor)))
+        return apply_time_stretch(y_ps, rate=factor)
 
-def simple_crossfade(a: np.ndarray, b: np.ndarray, sr: int, overlap_sec: float = 8.0) -> np.ndarray:
-    """Crossfade simple con curva mejorada"""
-    overlap_samples = int(overlap_sec * sr)
-    min_len = min(len(a), len(b), overlap_samples)
-    
-    if min_len <= 0:
-        return np.concatenate([a, b])
-    
-    # Curva de fade mejorada (sqrt para transición más suave)
-    fade_out = np.sqrt(np.linspace(1, 0, min_len))
-    fade_in = np.sqrt(np.linspace(0, 1, min_len))
-    
-    return np.concatenate([
-        a[:-min_len],
-        a[-min_len:] * fade_out + b[:min_len] * fade_in,
-        b[min_len:]
+def align_to_target(y: np.ndarray, sr: int, bpm: float, key_pc: int,
+                    target_bpm: float, target_key_pc: int | None,
+                    do_time: bool, do_pitch: bool) -> np.ndarray:
+    x = y
+    if do_time and bpm > 0:
+        rate = float(target_bpm) / float(bpm)
+        x = apply_time_stretch(x, rate)
+    if do_pitch and target_key_pc is not None:
+        x = apply_pitch_shift(x, sr, semitones_to_shift(key_pc, target_key_pc))
+    return x
+
+def make_equal_power_fade(n: int) -> tuple[np.ndarray, np.ndarray]:
+    t = np.linspace(0, 1, num=n, dtype=np.float32)
+    return np.cos(t * np.pi / 2), np.sin(t * np.pi / 2)
+
+def _samps(sec: float, sr: int) -> int:
+    return max(0, int(round(float(sec) * sr)))
+
+def crossfade_tracks(a: np.ndarray, b: np.ndarray, sr: int, overlap_sec: float = 10.0,
+                     a_mix_start: float = 0.0, b_mix_start: float = 0.0) -> tuple[np.ndarray, int, int]:
+    a_start = min(len(a), _samps(a_mix_start, sr))
+    b_start = min(len(b), _samps(b_mix_start, sr))
+    fade_len = _samps(overlap_sec, sr)
+
+    n = min(fade_len, len(a) - a_start, len(b) - b_start)
+    if n <= 0:
+        return np.concatenate([a, b]), a_start, a_start
+
+    a_seg = a[a_start:a_start + n]
+    b_seg = b[b_start:b_start + n]
+
+    fade_out, fade_in = make_equal_power_fade(n)
+    mixed_overlap = a_seg * fade_out + b_seg * fade_in
+
+    out = np.concatenate([
+        a[:a_start],
+        mixed_overlap,
+        b[b_start + n:],
     ])
+    return out, a_start, a_start + n   # ⬅️ devolvemos inicio y fin del crossfade
+
+def add_clean_segments(a: np.ndarray, b: np.ndarray, sr: int, extra_sec: int = 10,
+                       a_mix_start: float = 0.0, b_mix_start: float = 0.0,
+                       overlap_sec: float = 10.0) -> np.ndarray:
+    core, cross_start, cross_end = crossfade_tracks(a, b, sr, overlap_sec=overlap_sec,
+                                                    a_mix_start=a_mix_start, b_mix_start=b_mix_start)
+    pre = max(0, cross_start - _samps(extra_sec, sr))
+    post = min(len(core), cross_end + _samps(extra_sec, sr))
+
+    y = core[pre:post]
+
+    # Normalización suave
+    peak = np.max(np.abs(y)) if y.size else 1.0
+    if peak > 0.99:
+        y = (0.99 / peak) * y
+    return y.astype(np.float32)
 
 def write_wav_to_bytes(y: np.ndarray, sr: int) -> bytes:
-    """Escribe el audio a bytes con normalización"""
-    # Normalización de volumen
-    peak = np.max(np.abs(y))
-    if peak > 0.9:
-        y = y * (0.9 / peak)
-    
     buf = io.BytesIO()
     sf.write(buf, y, sr, format='WAV')
     buf.seek(0)
     return buf.read()
 
-# Interfaz de usuario mejorada
-st.set_page_config(page_title="DJ Mixer Pro", page_icon="🎛️", layout="wide")
-st.title("🎛️ Mezclador DJ Profesional")
+# -----------------------------
+# Streamlit UI
+# -----------------------------
+st.set_page_config(page_title="DJ Mixer AI", page_icon="🎧", layout="wide")
+st.title("🎧 Mezclador DJ con IA (Archivos locales)")
+st.write("Sube dos canciones y el sistema hará una mezcla con crossfade. "
+         "El output incluirá solo unos segundos antes y después de la mezcla.")
 
 with st.sidebar:
-    st.header("⚙️ Configuración de mezcla")
+    st.header("Opciones")
     target_bpm = st.slider("BPM objetivo", 60, 180, 124)
-    overlap_beats = st.slider("Beats de transición", 4, 16, 8)
-    use_beat_sync = st.checkbox("Sincronización por beats", value=True)
-    normalize = st.checkbox("Normalizar volumen", value=True)
+    align_tempo = st.checkbox("Alinear tempo", value=True)
+    align_key = st.checkbox("Alinear tono (pitch)", value=True)
+    extra_sec = st.slider("Segundos extra antes/después", 5, 20, 10)
+    overlap_sec = st.slider("Solapamiento (crossfade) [s]", 3, 20, 10)
+    a_mix_start = st.number_input("Inicio de mezcla en track A (seg)", min_value=0.0, value=30.0, step=1.0)
+    b_mix_start = st.number_input("Inicio de mezcla en track B (seg)", min_value=0.0, value=0.0, step=1.0)
 
 col1, col2 = st.columns(2)
 with col1:
-    file_a = st.file_uploader("Track A", type=["wav","mp3","ogg","flac"], key="a")
+    file_a = st.file_uploader("Canción A (WAV/MP3/OGG/FLAC)", type=["wav","mp3","ogg","flac"], key="a")
 with col2:
-    file_b = st.file_uploader("Track B", type=["wav","mp3","ogg","flac"], key="b")
+    file_b = st.file_uploader("Canción B (WAV/MP3/OGG/FLAC)", type=["wav","mp3","ogg","flac"], key="b")
 
-if file_a and file_b:
-    with st.spinner("Procesando pistas..."):
-        try:
-            y_a, sr_a = load_audio(file_a)
-            y_b, sr_b = load_audio(file_b)
-            
-            # Asegurar misma tasa de muestreo
-            if sr_a != sr_b:
-                y_b = librosa.resample(y_b, orig_sr=sr_b, target_sr=sr_a)
-                sr_b = sr_a
-            
-            # Estimar BPM y clave
-            bpm_a = estimate_bpm(y_a, sr_a)
-            bpm_b = estimate_bpm(y_b, sr_b)
-            
-            # Mezcla profesional
-            if use_beat_sync:
-                mixed = beat_sync_mix(y_a, y_b, sr_a, target_bpm, overlap_beats)
-            else:
-                mixed = simple_crossfade(y_a, y_b, sr_a, overlap_sec=overlap_beats*(60/target_bpm))
-            
-            st.success("✅ Mezcla completada")
-            st.audio(write_wav_to_bytes(mixed, sr_a), format='audio/wav')
-            
-        except Exception as e:
-            st.error(f"Error durante la mezcla: {str(e)}")
+track_info = {}
+for label, file in zip(["A","B"], [file_a, file_b]):
+    if file:
+        y, sr = load_audio(file)
+        bpm = estimate_bpm(y, sr)
+        key_label, key_pc = estimate_key(y, sr)
+        track_info[label] = dict(y=y, sr=sr, bpm=bpm, key=key_label, pc=key_pc)
+        st.sidebar.markdown(f"### Track {label}")
+        st.sidebar.metric(f"BPM {label}", f"{bpm:.1f}")
+        st.sidebar.caption(f"Clave {label}: {key_label}")
+
+if file_a and file_b and st.button("Mezclar 🎶"):
+    with st.spinner("Procesando tracks..."):
+        y_a = track_info["A"]["y"]; y_b = track_info["B"]["y"]
+        sr = track_info["A"]["sr"]
+        if track_info["B"]["sr"] != sr:
+            y_b = librosa.resample(y_b, orig_sr=track_info["B"]["sr"], target_sr=sr)
+
+        bpm_a = track_info["A"]["bpm"]; bpm_b = track_info["B"]["bpm"]
+        key_pc_a = track_info["A"]["pc"]; key_pc_b = track_info["B"]["pc"]
+
+        target_key_pc = key_pc_a if align_key else None
+
+        y_a_aligned = align_to_target(y_a, sr, bpm_a, key_pc_a, target_bpm, target_key_pc, align_tempo, align_key)
+        y_b_aligned = align_to_target(y_b, sr, bpm_b, key_pc_b, target_bpm, target_key_pc, align_tempo, align_key)
+
+        mixed = add_clean_segments(y_a_aligned, y_b_aligned, sr, extra_sec=extra_sec,
+                                   a_mix_start=a_mix_start, b_mix_start=b_mix_start,
+                                   overlap_sec=overlap_sec)
+
+    st.markdown("### Mezcla final")
+    wav_bytes = write_wav_to_bytes(mixed, sr)
+    st.audio(wav_bytes, format="audio/wav")
+    st.download_button("⬇️ Descargar mezcla (WAV)", data=wav_bytes,
+                       file_name="mezcla_dj_ai.wav", mime="audio/wav")
+else:
+    st.info("👆 Sube dos archivos de audio para comenzar.")

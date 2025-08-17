@@ -258,7 +258,7 @@ if file_a and file_b and st.button("Mezclar 🎶", type="primary"):
             
             # Añadir segmento extra
             extra_samples = int(extra_sec * sr_a)
-            start = max(0, int(a_mix_start * sr_a) - extra_samples
+            start = max(0, int(a_mix_start * sr_a) - extra_samples)
             end = min(len(mixed), int(b_mix_start * sr_a) + extra_samples)
             final_mix = mixed[start:end]
             

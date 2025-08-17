@@ -1,5 +1,5 @@
-numpy>=1.21.0
-soundfile>=0.10.0
-librosa>=0.9.0
-streamlit>=1.0.0
-matplotlib>=3.5.0
+numpy
+soundfile
+librosa
+streamlit
+matplotlib

@@ -209,10 +209,16 @@ def apply_pitch_shift(y: np.ndarray, sr: int, n_semitones: float) -> np.ndarray:
             ])
 
 @st.cache_data(show_spinner=False)
-def compute_beat_grid(y: np.ndarray, sr: int, start_bpm: Optional[float] = None) -> Tuple[np.ndarray, float]:
+def compute_beat_grid(y: np.ndarray, sr: int, start_bpm: Optional[float] = None):
     """Calcula los tiempos de beat y el tempo."""
     y_mono = to_mono(y)
-    tempo, beat_frames = librosa.beat.beat_track(y=y_mono, sr=sr, start_bpm=start_bpm, units='time')
+    
+    # Si start_bpm es None, usa un valor predeterminado (ej. 120)
+    tempo, beat_frames = librosa.beat.beat_track(
+        y=y_mono, 
+        sr=sr, 
+        start_bpm=start_bpm if start_bpm is not None else 120  # Valor predeterminado
+    )
     beat_times = librosa.frames_to_time(beat_frames, sr=sr)
     return beat_times, float(tempo)
 

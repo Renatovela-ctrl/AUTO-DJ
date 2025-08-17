@@ -1,5 +1,9 @@
 numpy
-soundfile
 librosa
-streamlit
+pydub
+scikit-learn
+soundfile
+tensorflow
+torch
+transformers
 matplotlib

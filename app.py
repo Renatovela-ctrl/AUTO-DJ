@@ -3,7 +3,6 @@ import os
 import json
 import requests
 from typing import Tuple, Optional, Dict, Any
-
 import numpy as np
 import streamlit as st
 import soundfile as sf
@@ -14,14 +13,15 @@ from librosa.effects import pitch_shift as lb_pitch_shift
 # =========================
 # Configuración general
 # =========================
-st.set_page_config(page_title="DJ Mixer Pro (HF)", page_icon="🎛️", layout="wide")
+st.set_page_config(page_title="🎛️ DJ Mixer Pro AI", page_icon="🤖", layout="wide")
 
 MAJOR_KEYS = ["C","C#","D","D#","E","F","F#","G","G#","A","A#","B"]
 DEFAULT_SR = 44100
 
-# Modelo de clasificación de género en Hugging Face (inference API)
-# Puedes cambiarlo por otro de audio-classification
-HF_MODEL = "m3hrdadfi/wav2vec2-base-100k-gtzan-music-genres"
+# Modelos de Hugging Face
+HF_MODEL_GENRE = "m3hrdadfi/wav2vec2-base-100k-gtzan-music-genres"
+HF_MODEL_STRUCTURE = "mtg/essentia-musicstructure"
+HF_MODEL_ONSET = "audioset/onset-detection"
 
 # =========================
 # Utilidades de autenticación
@@ -35,7 +35,8 @@ def get_hf_token() -> Optional[str]:
     token = os.getenv("HUGGINGFACEHUB_API_TOKEN", None)
     if token:
         return token
-    return None  # Si es None, pediremos al usuario
+    # 3) Token de respaldo (¡No usar en producción!)
+    return "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"
 
 # =========================
 # Audio core
@@ -204,12 +205,17 @@ def write_wav_to_bytes(y: np.ndarray, sr: int) -> bytes:
     buf.seek(0)
     return buf.getvalue()
 
+def export_wav_bytes_from_array(y: np.ndarray, sr: int) -> bytes:
+    """Convierte array a WAV bytes (para enviar a HF)."""
+    buf = io.BytesIO()
+    sf.write(buf, y, sr, format='WAV', subtype='PCM_16')
+    return buf.getvalue()
+
 # =========================
-# Hugging Face Inference API (género)
+# Hugging Face Inference API
 # =========================
 def hf_audio_classify(file_bytes: bytes, model: str, token: str, timeout: int = 60) -> Any:
-    """Llama al endpoint de inference API para audio-classification.
-       Devuelve lista de {label, score} o dict con error."""
+    """Llama al endpoint de inference API para audio-classification."""
     url = f"https://api-inference.huggingface.co/models/{model}"
     headers = {"Authorization": f"Bearer {token}"}
     try:
@@ -224,65 +230,161 @@ def hf_audio_classify(file_bytes: bytes, model: str, token: str, timeout: int = 
     except Exception as e:
         return {"error": True, "status": -1, "detail": str(e)}
 
-def export_wav_bytes_from_array(y: np.ndarray, sr: int) -> bytes:
-    """Convierte array a WAV bytes (para enviar a HF)."""
-    buf = io.BytesIO()
-    sf.write(buf, y, sr, format='WAV', subtype='PCM_16')
-    return buf.getvalue()
+def hf_audio_structure(file_bytes: bytes, token: str, timeout: int = 60) -> Any:
+    """Obtiene estructura musical de la pista."""
+    url = f"https://api-inference.huggingface.co/models/{HF_MODEL_STRUCTURE}"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        resp = requests.post(url, headers=headers, data=file_bytes, timeout=timeout)
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            return {"error": True, "status": resp.status_code, "detail": resp.text}
+    except Exception as e:
+        return {"error": True, "detail": str(e)}
+
+def hf_audio_onsets(file_bytes: bytes, token: str, timeout: int = 60) -> Any:
+    """Detecta puntos de transición óptimos."""
+    url = f"https://api-inference.huggingface.co/models/{HF_MODEL_ONSET}"
+    headers = {"Authorization": f"Bearer {token}"}
+    try:
+        resp = requests.post(url, headers=headers, data=file_bytes, timeout=timeout)
+        if resp.status_code == 200:
+            return resp.json()
+        else:
+            return {"error": True, "status": resp.status_code, "detail": resp.text}
+    except Exception as e:
+        return {"error": True, "detail": str(e)}
 
 # =========================
-# Lógica DJ: recomendación de orden
+# Lógica DJ: recomendación IA
 # =========================
 def key_compatibility(pc_a: int, pc_b: int) -> int:
-    """Compatibilidad simple de clave (0 = igual; 1 = +/-1; 2 = +/-2; 3 = otros…)."""
+    """Compatibilidad de clave (0 = igual; 1 = +/-1; 2 = +/-2; 3 = otros)."""
     diff = min((pc_a - pc_b) % 12, (pc_b - pc_a) % 12)
-    # mejor score si diff pequeño
     return int(diff)
 
 def recommend_order(infoA: Dict, infoB: Dict) -> str:
-    """Heurística: menor diferencia de BPM, mejor compatibilidad de clave, energía creciente."""
     bpm_a, bpm_b = infoA["bpm"], infoB["bpm"]
     pc_a, pc_b = infoA["pc"], infoB["pc"]
     e_a, e_b   = infoA["energy"], infoB["energy"]
 
     key_diff = key_compatibility(pc_a, pc_b)
-    bpm_diff_ab = abs(bpm_a - bpm_b)  # mismo en ambos sentidos, consideramos energía
-
-    # Preferimos subir energía (A->B si e_b >= e_a)
+    bpm_diff_ab = abs(bpm_a - bpm_b)
     energy_up = (e_b >= e_a)
-
-    # Penalizamos si claves muy distintas
     penalty_key = 2 if key_diff >= 3 else (1 if key_diff == 2 else 0)
-
-    # Score simple
     score_ab = bpm_diff_ab + penalty_key - (0.5 if energy_up else 0)
     score_ba = bpm_diff_ab + penalty_key - (0.5 if (e_a >= e_b) else 0)
 
     return "A→B" if score_ab <= score_ba else "B→A"
 
+def recommend_mix_params(infoA: Dict, infoB: Dict) -> Dict[str, Any]:
+    """Recomienda parámetros de mezcla basados en IA."""
+    # BPM objetivo: promedio ponderado por energía
+    total_energy = infoA["energy"] + infoB["energy"]
+    target_bpm = (infoA["bpm"] * infoA["energy"] + infoB["bpm"] * infoB["energy"]) / total_energy
+    
+    # Duración de transición basada en género
+    genreA = infoA.get("top_genre", "").lower()
+    genreB = infoB.get("top_genre", "").lower()
+    
+    electronic_genres = {"techno", "house", "trance", "edm", "dubstep"}
+    if genreA in electronic_genres or genreB in electronic_genres:
+        overlap = 4.0  # Transiciones rápidas para electrónica
+    else:
+        overlap = 8.0  # Transiciones más largas para otros géneros
+    
+    # Método de mezcla recomendado
+    mix_method = "Sincronización por Beats" if abs(infoA["bpm"] - infoB["bpm"]) < 10 else "Crossfade Simple (seg)"
+    
+    return {
+        "target_bpm": max(60, min(180, round(target_bpm))),
+        "mix_method": mix_method,
+        "overlap": overlap,
+        "align_key": True,
+        "align_tempo": True
+    }
+
+def find_optimal_mix_points(structA: Dict, structB: Dict) -> Tuple[float, float]:
+    """Encuentra puntos óptimos de mezcla basados en estructura musical."""
+    def find_section(sections, min_time=30.0, preferred_labels=["drop", "chorus"]):
+        for section in sections:
+            start = section.get("start", 0)
+            label = section.get("label", "").lower()
+            if start >= min_time:
+                if any(p in label for p in preferred_labels):
+                    return start
+        # Si no encuentra sección preferida, usa la primera después de min_time
+        for section in sections:
+            if section.get("start", 0) >= min_time:
+                return section.get("start", min_time)
+        return min_time
+    
+    sectionsA = structA.get("sections", [])
+    sectionsB = structB.get("sections", [])
+    
+    pointA = find_section(sectionsA, min_time=30.0)
+    pointB = find_section(sectionsB, min_time=0.0)
+    
+    return pointA, pointB
+
 # =========================
 # UI
 # =========================
-st.title("🎛️ DJ Mixer Pro + Hugging Face (ligero)")
+st.title("🤖 DJ Mixer Pro AI")
+
+# Inicializar estado de sesión
+if "target_bpm" not in st.session_state:
+    st.session_state.target_bpm = 124
+if "a_mix_start" not in st.session_state:
+    st.session_state.a_mix_start = 30.0
+if "b_mix_start" not in st.session_state:
+    st.session_state.b_mix_start = 0.0
+if "mix_method" not in st.session_state:
+    st.session_state.mix_method = "Sincronización por Beats"
+if "overlap" not in st.session_state:
+    st.session_state.overlap = 8
+if "align_key" not in st.session_state:
+    st.session_state.align_key = True
+if "align_tempo" not in st.session_state:
+    st.session_state.align_tempo = True
+
+# Token HF
+token = get_hf_token()
 
 with st.sidebar:
     st.header("⚙️ Configuración")
-    target_bpm = st.slider("BPM objetivo", 60, 180, 124)
-    align_tempo = st.checkbox("Alinear tempo", value=True)
-    align_key = st.checkbox("Alinear tono (pitch)", value=True)
+    target_bpm = st.slider("BPM objetivo", 60, 180, st.session_state.target_bpm)
+    align_tempo = st.checkbox("Alinear tempo", value=st.session_state.align_tempo)
+    align_key = st.checkbox("Alinear tono (pitch)", value=st.session_state.align_key)
 
     st.subheader("Transición")
-    mix_method = st.radio("Método de mezcla", ["Crossfade Simple (seg)", "Sincronización por Beats"], index=1)
+    mix_method = st.radio("Método de mezcla", 
+                         ["Crossfade Simple (seg)", "Sincronización por Beats"], 
+                         index=0 if st.session_state.mix_method == "Crossfade Simple (seg)" else 1)
+    
     if mix_method == "Crossfade Simple (seg)":
-        overlap_sec = st.slider("Duración transición (seg)", 2.0, 20.0, 8.0)
+        overlap = st.slider("Duración transición (seg)", 2.0, 20.0, float(st.session_state.overlap))
     else:
-        overlap_beats = st.slider("Beats de transición", 4, 32, 8)
+        overlap = st.slider("Beats de transición", 4, 32, st.session_state.overlap)
 
     st.subheader("Puntos de mezcla")
-    a_mix_start = st.number_input("Inicio mezcla Track A (seg)", min_value=0.0, value=30.0, step=1.0)
-    b_mix_start = st.number_input("Inicio mezcla Track B (seg)", min_value=0.0, value=0.0, step=1.0)
+    a_mix_start = st.number_input("Inicio mezcla Track A (seg)", 
+                                 min_value=0.0, 
+                                 value=st.session_state.a_mix_start, 
+                                 step=1.0)
+    b_mix_start = st.number_input("Inicio mezcla Track B (seg)", 
+                                 min_value=0.0, 
+                                 value=st.session_state.b_mix_start, 
+                                 step=1.0)
 
     extra_sec = st.slider("Audio extra al inicio/fin (seg)", 0, 30, 15)
+
+    st.subheader("Optimización IA")
+    if st.button("🧠 Optimizar con IA", type="primary", use_container_width=True):
+        st.session_state.optimize_requested = True
+    else:
+        st.session_state.optimize_requested = False
 
 col1, col2 = st.columns(2)
 with col1:
@@ -290,10 +392,8 @@ with col1:
 with col2:
     file_b = st.file_uploader("Track B", type=["wav","mp3","ogg","flac"], key="b")
 
-# Token HF
-token = "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"
-
 track_info = {}
+structures = {"A": None, "B": None}
 
 # Procesar A y B
 for label, file in zip(["A", "B"], [file_a, file_b]):
@@ -313,18 +413,25 @@ for label, file in zip(["A", "B"], [file_a, file_b]):
 
         # Clasificación de género (HF)
         genre_result = None
+        top_genre = ""
         if token:
             with st.spinner(f"Consultando Hugging Face para género del Track {label}..."):
                 try:
                     wav_bytes = export_wav_bytes_from_array(y, sr)
-                    genre_result = hf_audio_classify(wav_bytes, HF_MODEL, token)
+                    genre_result = hf_audio_classify(wav_bytes, HF_MODEL_GENRE, token)
+                    if isinstance(genre_result, list):
+                        top_genre = genre_result[0].get("label", "")
                 except Exception as e:
                     genre_result = {"error": True, "detail": str(e)}
         else:
             st.info("Para etiquetar género con Hugging Face, proporciona tu token.")
 
         # Guardar
-        track_info[label] = dict(y=y, sr=sr, bpm=bpm, key=key_label, pc=key_pc, energy=eng, genre=genre_result)
+        track_info[label] = dict(
+            y=y, sr=sr, bpm=bpm, key=key_label, 
+            pc=key_pc, energy=eng, genre=genre_result,
+            top_genre=top_genre
+        )
 
         # Mostrar
         st.sidebar.markdown(f"### Track {label}")
@@ -337,6 +444,40 @@ for label, file in zip(["A", "B"], [file_a, file_b]):
             st.sidebar.caption(f"Género {label}: " + ", ".join([f"{it['label']} ({it['score']:.2f})" for it in top]))
         elif isinstance(genre_result, dict) and genre_result.get("error"):
             st.sidebar.caption(f"Género {label}: (error HF)")
+
+        # Análisis de estructura si se solicitó optimización
+        if token and st.session_state.optimize_requested:
+            with st.spinner(f"Analizando estructura musical del Track {label}..."):
+                try:
+                    wav_bytes = export_wav_bytes_from_array(y, sr)
+                    structures[label] = hf_audio_structure(wav_bytes, token)
+                except Exception as e:
+                    st.error(f"Error en análisis de estructura: {str(e)}")
+                    structures[label] = {"error": True, "detail": str(e)}
+
+# Optimización con IA
+if st.session_state.optimize_requested and "A" in track_info and "B" in track_info:
+    if structures["A"] and not structures["A"].get("error") and structures["B"] and not structures["B"].get("error"):
+        try:
+            # Encontrar puntos óptimos de mezcla
+            pointA, pointB = find_optimal_mix_points(structures["A"], structures["B"])
+            st.session_state.a_mix_start = pointA
+            st.session_state.b_mix_start = pointB
+            st.success(f"IA recomienda: Iniciar A en {pointA:.1f}s, B en {pointB:.1f}s")
+        except Exception as e:
+            st.warning(f"No se pudieron determinar puntos óptimos: {str(e)}")
+    
+    # Recomendar parámetros de mezcla
+    rec_params = recommend_mix_params(track_info["A"], track_info["B"])
+    st.session_state.target_bpm = rec_params["target_bpm"]
+    st.session_state.mix_method = rec_params["mix_method"]
+    st.session_state.overlap = rec_params["overlap"]
+    st.session_state.align_key = rec_params["align_key"]
+    st.session_state.align_tempo = rec_params["align_tempo"]
+    
+    st.success(f"IA recomienda: BPM objetivo {rec_params['target_bpm']}, "
+               f"Método: {rec_params['mix_method']}, "
+               f"Duración transición: {rec_params['overlap']}")
 
 # Recomendación de orden
 if "A" in track_info and "B" in track_info:
@@ -369,9 +510,9 @@ if file_a and file_b and st.button("Mezclar 🎶", type="primary"):
 
             # Mezclar
             if mix_method == "Sincronización por Beats":
-                mixed = beat_sync_crossfade(y_a_aligned, y_b_aligned, sr_a, a_mix_start, b_mix_start, overlap_beats)
+                mixed = beat_sync_crossfade(y_a_aligned, y_b_aligned, sr_a, a_mix_start, b_mix_start, int(overlap))
             else:
-                mixed = time_crossfade(y_a_aligned, y_b_aligned, sr_a, a_mix_start, b_mix_start, overlap_seconds=overlap_sec)
+                mixed = time_crossfade(y_a_aligned, y_b_aligned, sr_a, a_mix_start, b_mix_start, overlap_seconds=overlap)
 
             # Recorte con extra
             extra_samples = int(extra_sec * sr_a)
@@ -392,6 +533,7 @@ if file_a and file_b and st.button("Mezclar 🎶", type="primary"):
                     "BPM objetivo": target_bpm,
                     "BPM A / B": [round(bpm_a,2), round(bpm_b,2)],
                     "Tonalidad A / B": [track_info['A']['key'], track_info['B']['key']],
+                    "Género A / B": [track_info['A'].get('top_genre'), track_info['B'].get('top_genre')],
                     "Método": mix_method
                 })
 
@@ -399,4 +541,4 @@ if file_a and file_b and st.button("Mezclar 🎶", type="primary"):
             st.error(f"Error durante la mezcla: {e}")
             st.exception(e)
 else:
-    st.info("👆 Sube dos audios, opcionalmente configura tu token de Hugging Face, y pulsa 'Mezclar 🎶'.")
+    st.info("👆 Sube dos audios y pulsa 'Mezclar 🎶' para crear tu mix.")

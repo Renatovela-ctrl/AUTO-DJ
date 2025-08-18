@@ -1,9 +1,5 @@
 streamlit
 numpy
 librosa
-pydub
-scikit-learn
 soundfile
-torch
-transformers
-matplotlib
+requests

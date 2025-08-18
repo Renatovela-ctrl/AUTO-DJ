@@ -1,9 +1,9 @@
+streamlit
 numpy
 librosa
 pydub
 scikit-learn
 soundfile
-tensorflow
 torch
 transformers
 matplotlib
